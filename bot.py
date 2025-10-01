@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import mimetypes
 import os
 import re
 from dataclasses import dataclass
@@ -11,7 +12,7 @@ import aiohttp
 import aiosqlite
 from bs4 import BeautifulSoup, NavigableString, Tag
 from dotenv import load_dotenv
-from telegram import InputFile, InputMediaPhoto, Update
+from telegram import InputFile, InputMediaPhoto, InputMediaVideo, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from urllib.parse import urlparse
 
@@ -137,8 +138,16 @@ async def add_posted_message(message_id: int, channel_username: str) -> None:
 
 @dataclass
 class MediaAttachment:
-    kind: str  # e.g. "photo"
+    kind: str  # e.g. "photo", "video"
     url: str
+
+
+@dataclass
+class DownloadedMedia:
+    attachment: MediaAttachment
+    content: bytes
+    filename: str
+    mime_type: Optional[str]
 
 
 @dataclass
@@ -227,22 +236,51 @@ class TelegramChannelParser:
     def _extract_media(element: Tag) -> List[MediaAttachment]:
         media: List[MediaAttachment] = []
 
-        seen: set[str] = set()
+        seen_urls: set[str] = set()
+        processed_videos: set[int] = set()
 
-        for photo in element.select("a.tgme_widget_message_photo_wrap"):
-            style = photo.get("style", "")
-            match = re.search(r"background-image:url\('([^']+)'\)", style)
-            if match:
-                url = match.group(1)
-                if url not in seen:
-                    seen.add(url)
-                    media.append(MediaAttachment(kind="photo", url=url))
+        for node in element.find_all(["a", "video"], recursive=True):
+            classes = node.get("class", [])
+
+            if "tgme_widget_message_photo_wrap" in classes:
+                style = node.get("style", "")
+                match = re.search(r"background-image:url\('([^']+)'\)", style)
+                if match:
+                    url = match.group(1)
+                    if url not in seen_urls:
+                        seen_urls.add(url)
+                        media.append(MediaAttachment(kind="photo", url=url))
+                continue
+
+            if any(
+                cls in classes
+                for cls in (
+                    "tgme_widget_message_video_player",
+                    "tgme_widget_message_roundvideo_wrap",
+                )
+            ):
+                video_tag = node.find("video")
+                if video_tag and video_tag.get("src"):
+                    src = video_tag["src"]
+                    if src not in seen_urls:
+                        seen_urls.add(src)
+                        media.append(MediaAttachment(kind="video", url=src))
+                    processed_videos.add(id(video_tag))
+                continue
+
+            if node.name == "video" and "tgme_widget_message_video" in classes:
+                if id(node) in processed_videos:
+                    continue
+                src = node.get("src")
+                if src and src not in seen_urls:
+                    seen_urls.add(src)
+                    media.append(MediaAttachment(kind="video", url=src))
 
         photo_view = element.find("a", class_="tgme_widget_message_photo_view")
         if photo_view and photo_view.has_attr("href"):
             url = photo_view["href"]
-            if url not in seen:
-                seen.add(url)
+            if url not in seen_urls:
+                seen_urls.add(url)
                 media.append(MediaAttachment(kind="photo", url=url))
 
         return media
@@ -403,51 +441,84 @@ class NewsRelay:
 
         if message.media:
             try:
-                downloaded = await self._download_media(message.media)
+                downloaded = await self._download_media(message)
 
                 if not downloaded:
                     raise RuntimeError("empty media download result")
 
+                caption_text = text_html or message.plain_text or None
+                caption_parse_mode = "HTML" if text_html else None
+
                 if len(downloaded) == 1:
-                    attachment, content = downloaded[0]
-                    file = InputFile(
-                        content,
-                        filename=self._build_media_filename(message, attachment),
-                    )
-                    await self.app.bot.send_photo(
-                        chat_id=self.publisher_channel_id,
-                        photo=file,
-                        caption=text_html if text_html else None,
-                        parse_mode="HTML" if text_html else None,
-                    )
+                    media_item = downloaded[0]
+                    file = InputFile(media_item.content, filename=media_item.filename)
+                    if media_item.attachment.kind == "photo":
+                        await self.app.bot.send_photo(
+                            chat_id=self.publisher_channel_id,
+                            photo=file,
+                            caption=caption_text,
+                            parse_mode=caption_parse_mode,
+                        )
+                    elif media_item.attachment.kind == "video":
+                        await self.app.bot.send_video(
+                            chat_id=self.publisher_channel_id,
+                            video=file,
+                            caption=caption_text,
+                            parse_mode=caption_parse_mode,
+                            supports_streaming=True,
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"Unsupported media kind {media_item.attachment.kind}"
+                        )
                 else:
                     media_group = []
-                    for index, (attachment, content) in enumerate(downloaded):
+                    for index, media_item in enumerate(downloaded):
                         file = InputFile(
-                            content,
-                            filename=self._build_media_filename(message, attachment, index=index),
+                            media_item.content, filename=media_item.filename
                         )
-                        if index == 0:
+                        item_caption = caption_text if index == 0 else None
+                        item_parse_mode = caption_parse_mode if index == 0 else None
+
+                        if media_item.attachment.kind == "photo":
                             media_group.append(
                                 InputMediaPhoto(
                                     media=file,
-                                    caption=text_html if text_html else None,
-                                    parse_mode="HTML" if text_html else None,
+                                    caption=item_caption,
+                                    parse_mode=item_parse_mode,
+                                )
+                            )
+                        elif media_item.attachment.kind == "video":
+                            media_group.append(
+                                InputMediaVideo(
+                                    media=file,
+                                    caption=item_caption,
+                                    parse_mode=item_parse_mode,
+                                    supports_streaming=True,
                                 )
                             )
                         else:
-                            media_group.append(InputMediaPhoto(media=file))
+                            raise RuntimeError(
+                                f"Unsupported media kind {media_item.attachment.kind}"
+                            )
+                        if index == 0:
+                            # caption already added via InputMedia above
+                            pass
 
                     await self.app.bot.send_media_group(
                         chat_id=self.publisher_channel_id,
                         media=media_group,
                     )
 
-                logger.info("Forwarded photo message %s from %s", message.message_id, message.channel)
+                logger.info(
+                    "Forwarded media message %s from %s",
+                    message.message_id,
+                    message.channel,
+                )
                 return True
             except Exception as exc:
                 logger.warning(
-                    "Failed to send photo message %s from %s: %s",
+                    "Failed to send media message %s from %s: %s",
                     message.message_id,
                     message.channel,
                     exc,
@@ -470,10 +541,8 @@ class NewsRelay:
         logger.info("Skipping empty message %s from %s", message.message_id, message.channel)
         return False
 
-    async def _download_media(
-        self, attachments: List[MediaAttachment]
-    ) -> List[Tuple[MediaAttachment, bytes]]:
-        results: List[Tuple[MediaAttachment, bytes]] = []
+    async def _download_media(self, message: ParsedMessage) -> List[DownloadedMedia]:
+        results: List[DownloadedMedia] = []
         session = self.parser.session
 
         headers = {
@@ -484,7 +553,7 @@ class NewsRelay:
             )
         }
 
-        for attachment in attachments:
+        for index, attachment in enumerate(message.media):
             async with session.get(attachment.url, headers=headers) as response:
                 if response.status != 200:
                     raise RuntimeError(
@@ -493,7 +562,21 @@ class NewsRelay:
                 data = await response.read()
                 if not data:
                     raise RuntimeError(f"Empty media payload from {attachment.url}")
-                results.append((attachment, data))
+                content_type = response.headers.get("Content-Type")
+                filename = self._build_media_filename(
+                    message,
+                    attachment,
+                    index=index if len(message.media) > 1 else None,
+                    mime_type=content_type,
+                )
+                results.append(
+                    DownloadedMedia(
+                        attachment=attachment,
+                        content=data,
+                        filename=filename,
+                        mime_type=content_type,
+                    )
+                )
 
         return results
 
@@ -503,6 +586,7 @@ class NewsRelay:
         attachment: MediaAttachment,
         *,
         index: Optional[int] = None,
+        mime_type: Optional[str] = None,
     ) -> str:
         path = urlparse(attachment.url).path
         basename = os.path.basename(path) or f"{message.channel}_{message.message_id}"
@@ -510,7 +594,17 @@ class NewsRelay:
 
         stem, ext = os.path.splitext(basename)
         if not ext:
-            ext = ".jpg"
+            if mime_type:
+                guessed = mimetypes.guess_extension(mime_type.split(";")[0].strip())
+                if guessed:
+                    ext = guessed
+            if not ext:
+                if attachment.kind == "photo":
+                    ext = ".jpg"
+                elif attachment.kind == "video":
+                    ext = ".mp4"
+                else:
+                    ext = ".bin"
 
         if index is not None:
             stem = f"{stem}_{index}"
