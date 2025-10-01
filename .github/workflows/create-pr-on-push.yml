@@ -1,0 +1,37 @@
+name: Create PR on push to feature branch
+
+on:
+  push:
+    branches:
+      - "feature/news-aggregator"
+
+jobs:
+  create-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base: main
+          title: "feat: forward media using downloaded originals"
+          body: |
+            ## Summary
+            - download Telegram media assets before forwarding to preserve original photos/albums
+            - switch parser to store MediaAttachment objects and avoid duplicate URLs
+            - upgrade python-telegram-bot to 21.x and ignore posted_messages.db locally
+
+            ## Testing
+            - python -m compileall bot.py
+            - pytest
+            - ruff check
+          branch: feature/news-aggregator
