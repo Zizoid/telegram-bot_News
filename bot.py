@@ -14,6 +14,18 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+# ---------------------------------------------------------------------------
+# Compatibility fixes for python-telegram-bot on Python 3.13
+# ---------------------------------------------------------------------------
+
+try:  # pragma: no cover - defensive compatibility patch
+    from telegram.ext._updater import Updater as _Updater
+
+    if hasattr(_Updater, "__slots__") and "_Updater__polling_cleanup_cb" not in _Updater.__slots__:
+        _Updater.__slots__ = tuple(_Updater.__slots__) + ("_Updater__polling_cleanup_cb",)
+except Exception:  # pylint: disable=broad-except
+    pass
+
 
 # ---------------------------------------------------------------------------
 # Logging & configuration
