@@ -11,8 +11,9 @@ import aiohttp
 import aiosqlite
 from bs4 import BeautifulSoup, NavigableString, Tag
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InputFile, InputMediaPhoto, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
 # Compatibility fixes for python-telegram-bot on Python 3.13
@@ -135,12 +136,18 @@ async def add_posted_message(message_id: int, channel_username: str) -> None:
 
 
 @dataclass
+class MediaAttachment:
+    kind: str  # e.g. "photo"
+    url: str
+
+
+@dataclass
 class ParsedMessage:
     channel: str
     message_id: int
     text_html: str
     plain_text: str
-    media_url: Optional[str]
+    media: List[MediaAttachment]
     published_at: datetime
 
 
@@ -178,7 +185,7 @@ class TelegramChannelParser:
                     continue
 
                 text_html, plain_text = self._extract_text(element)
-                media_url = self._extract_media(element)
+                media = self._extract_media(element)
 
                 messages.append(
                     ParsedMessage(
@@ -186,7 +193,7 @@ class TelegramChannelParser:
                         message_id=message_id,
                         text_html=text_html,
                         plain_text=plain_text,
-                        media_url=media_url,
+                        media=media,
                         published_at=datetime.utcnow(),
                     )
                 )
@@ -217,19 +224,28 @@ class TelegramChannelParser:
         return html_content, plain_text
 
     @staticmethod
-    def _extract_media(element: Tag) -> Optional[str]:
-        photo = element.find("a", class_="tgme_widget_message_photo_wrap")
-        if photo:
+    def _extract_media(element: Tag) -> List[MediaAttachment]:
+        media: List[MediaAttachment] = []
+
+        seen: set[str] = set()
+
+        for photo in element.select("a.tgme_widget_message_photo_wrap"):
             style = photo.get("style", "")
             match = re.search(r"background-image:url\('([^']+)'\)", style)
             if match:
-                return match.group(1)
+                url = match.group(1)
+                if url not in seen:
+                    seen.add(url)
+                    media.append(MediaAttachment(kind="photo", url=url))
 
         photo_view = element.find("a", class_="tgme_widget_message_photo_view")
         if photo_view and photo_view.has_attr("href"):
-            return photo_view["href"]
+            url = photo_view["href"]
+            if url not in seen:
+                seen.add(url)
+                media.append(MediaAttachment(kind="photo", url=url))
 
-        return None
+        return media
 
 
 # ---------------------------------------------------------------------------
@@ -385,14 +401,48 @@ class NewsRelay:
     async def _publish(self, message: ParsedMessage) -> bool:
         text_html = message.text_html or message.plain_text
 
-        if message.media_url:
+        if message.media:
             try:
-                await self.app.bot.send_photo(
-                    chat_id=self.publisher_channel_id,
-                    photo=message.media_url,
-                    caption=text_html if text_html else None,
-                    parse_mode="HTML" if text_html else None,
-                )
+                downloaded = await self._download_media(message.media)
+
+                if not downloaded:
+                    raise RuntimeError("empty media download result")
+
+                if len(downloaded) == 1:
+                    attachment, content = downloaded[0]
+                    file = InputFile(
+                        content,
+                        filename=self._build_media_filename(message, attachment),
+                    )
+                    await self.app.bot.send_photo(
+                        chat_id=self.publisher_channel_id,
+                        photo=file,
+                        caption=text_html if text_html else None,
+                        parse_mode="HTML" if text_html else None,
+                    )
+                else:
+                    media_group = []
+                    for index, (attachment, content) in enumerate(downloaded):
+                        file = InputFile(
+                            content,
+                            filename=self._build_media_filename(message, attachment, index=index),
+                        )
+                        if index == 0:
+                            media_group.append(
+                                InputMediaPhoto(
+                                    media=file,
+                                    caption=text_html if text_html else None,
+                                    parse_mode="HTML" if text_html else None,
+                                )
+                            )
+                        else:
+                            media_group.append(InputMediaPhoto(media=file))
+
+                    await self.app.bot.send_media_group(
+                        chat_id=self.publisher_channel_id,
+                        media=media_group,
+                    )
+
                 logger.info("Forwarded photo message %s from %s", message.message_id, message.channel)
                 return True
             except Exception as exc:
@@ -419,6 +469,53 @@ class NewsRelay:
 
         logger.info("Skipping empty message %s from %s", message.message_id, message.channel)
         return False
+
+    async def _download_media(
+        self, attachments: List[MediaAttachment]
+    ) -> List[Tuple[MediaAttachment, bytes]]:
+        results: List[Tuple[MediaAttachment, bytes]] = []
+        session = self.parser.session
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/118.0 Safari/537.36"
+            )
+        }
+
+        for attachment in attachments:
+            async with session.get(attachment.url, headers=headers) as response:
+                if response.status != 200:
+                    raise RuntimeError(
+                        f"Failed to download media from {attachment.url}: HTTP {response.status}"
+                    )
+                data = await response.read()
+                if not data:
+                    raise RuntimeError(f"Empty media payload from {attachment.url}")
+                results.append((attachment, data))
+
+        return results
+
+    @staticmethod
+    def _build_media_filename(
+        message: ParsedMessage,
+        attachment: MediaAttachment,
+        *,
+        index: Optional[int] = None,
+    ) -> str:
+        path = urlparse(attachment.url).path
+        basename = os.path.basename(path) or f"{message.channel}_{message.message_id}"
+        basename = basename.split("?")[0]
+
+        stem, ext = os.path.splitext(basename)
+        if not ext:
+            ext = ".jpg"
+
+        if index is not None:
+            stem = f"{stem}_{index}"
+
+        return f"{stem}{ext}"
 
 
 # ---------------------------------------------------------------------------

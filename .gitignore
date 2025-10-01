@@ -5,3 +5,4 @@ bot.log
 .idea/
 .vscode/
 *.pyc
+posted_messages.db
