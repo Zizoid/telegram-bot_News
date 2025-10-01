@@ -23,6 +23,8 @@ try:  # pragma: no cover - defensive compatibility patch
 
     if hasattr(_Updater, "__slots__") and "_Updater__polling_cleanup_cb" not in _Updater.__slots__:
         _Updater.__slots__ = tuple(_Updater.__slots__) + ("_Updater__polling_cleanup_cb",)
+    if not hasattr(_Updater, "_Updater__polling_cleanup_cb"):
+        setattr(_Updater, "_Updater__polling_cleanup_cb", None)
 except Exception:  # pylint: disable=broad-except
     pass
 
